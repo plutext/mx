@@ -26,7 +26,7 @@
 
 from __future__ import print_function
 
-import os, re, time, datetime
+import os, re, time, datetime, json
 import tempfile
 import pipes
 import zipfile
@@ -44,18 +44,18 @@ class Tags:
     style = 'style'         # code style checks (without build)
     build = 'build'         # build
     ecjbuild = 'ecjbuild'   # build with ecj only
-    fullbuild = 'fullbuild' # full build (including warnings, findbugs and ide init)
+    fullbuild = 'fullbuild' # full build (including warnings, spotbugs and ide init)
 
 """
 Context manager for a single gate task that can prevent the
 task from executing or time and log its execution.
 """
 class Task:
-    # None or a list of strings. If not None, only tasks whose title
+    # A list of strings. If not empty, only tasks whose title
     # matches at least one of the substrings in this list will return
     # a non-None value from __enter__. The body of a 'with Task(...) as t'
     # statement should check 't' and exit immediately if it is None.
-    filters = None
+    filters = []
     log = True # whether to log task messages
     dryRun = False
     startAtFilter = None
@@ -73,8 +73,8 @@ class Task:
 
     def tag_matches(self, _tags):
         for t in _tags:
-            assert isinstance(t, basestring), '{} is not a string and thus not a valid tag'.format(t)
-            if t in Task.tags:
+            assert isinstance(t, str), '{} is not a string and thus not a valid tag'.format(t)
+            if Task.tags is not None and t in Task.tags: # pylint: disable=unsupported-membership-test
                 if t not in Task.tags_range:
                     # no range restriction
                     return True
@@ -83,7 +83,7 @@ class Task:
                     cnt = Task.tags_count[t]
                     # increment counter
                     Task.tags_count[t] += 1
-                    if frm <= cnt and cnt < to:
+                    if frm <= cnt < to:
                         return True
         return False
 
@@ -117,7 +117,7 @@ class Task:
                     Task.startAtFilter = None
                 else:
                     self.skipped = True
-            elif Task.filters:
+            elif len(Task.filters) > 0:
                 titles = [self.title] + self.legacyTitles
                 if Task.filtersExclude:
                     self.skipped = any([f in t for t in titles for f in Task.filters])
@@ -125,7 +125,7 @@ class Task:
                     self.skipped = not any([f in t for t in titles for f in Task.filters])
             if Task.tags is not None:
                 if Task.tagsExclude:
-                    self.skipped = all([t in Task.tags for t in self.tags]) if tags else False
+                    self.skipped = all([t in Task.tags for t in self.tags]) if tags else False # pylint: disable=unsupported-membership-test
                 else:
                     _tags = self.tags if self.tags else []
                     self.skipped = not self.tag_matches(_tags)
@@ -436,7 +436,7 @@ def gate(args):
     mx.log('  ' + str(total.duration))
 
     if args.task_filter:
-        Task.filters = None
+        Task.filters = []
 
 def _collect_tasks(cleanArgs, args):
     prevDryRun = Task.dryRun
@@ -457,6 +457,7 @@ def _run_gate(cleanArgs, args, tasks):
         if t:
             mx.command_function('version')(['--oneline'])
             mx.command_function('sversions')([])
+            mx.log("Python version: {}".format(sys.version_info))
 
     with Task('JDKReleaseInfo', tasks, tags=[Tags.always]) as t:
         if t:
@@ -467,6 +468,10 @@ def _run_gate(cleanArgs, args, tasks):
                     mx.log('==== ' + jdkDir + ' ====')
                     with open(release) as fp:
                         mx.log(fp.read().strip())
+
+    with Task('VerifyMultiReleaseProjects', tasks, tags=[Tags.always]) as t:
+        if t:
+            mx.command_function('verifymultireleaseprojects')([])
 
     for suiteRunner in _pre_gate_runners:
         suite, runner = suiteRunner
@@ -501,7 +506,7 @@ def _run_gate(cleanArgs, args, tasks):
         with Task('BuildWithEcj', tasks, tags=[Tags.fullbuild, Tags.ecjbuild], legacyTitles=['BuildJavaWithEcj']) as t:
             if t:
                 defaultBuildArgs = ['-p']
-                fullbuild = True if Task.tags is None else Tags.fullbuild in Task.tags
+                fullbuild = True if Task.tags is None else Tags.fullbuild in Task.tags # pylint: disable=unsupported-membership-test
                 # Using ecj alone is not compatible with --warning-as-error (see GR-3969)
                 if not args.no_warning_as_error and fullbuild:
                     defaultBuildArgs += ['--warning-as-error']
@@ -538,15 +543,15 @@ def _run_gate(cleanArgs, args, tasks):
         if t and mx.command_function('checkstyle')(['--primary']) != 0:
             t.abort('Checkstyle warnings were found')
 
-    with Task('FindBugs', tasks, tags=[Tags.fullbuild]) as t:
-        if t and mx.command_function('findbugs')([]) != 0:
+    with Task('SpotBugs', tasks, tags=[Tags.fullbuild]) as t:
+        if t and mx.command_function('spotbugs')([]) != 0:
             t.abort('FindBugs warnings were found')
 
     with Task('VerifyLibraryURLs', tasks, tags=[Tags.fullbuild]) as t:
         if t:
             mx.command_function('verifylibraryurls')([])
 
-    jacoco_exec = 'jacoco.exec'
+    jacoco_exec = JACOCO_EXEC
     if exists(jacoco_exec):
         os.unlink(jacoco_exec)
 
@@ -581,6 +586,9 @@ def checkheaders(args):
            'the required checks depending on the mx configuration.')
     return 0
 
+
+JACOCO_EXEC = 'jacoco.exec'
+
 _jacoco = 'off'
 
 _jacoco_includes = []
@@ -611,13 +619,16 @@ def _jacoco_excludes_includes():
     includes = list(_jacoco_includes)
     baseExcludes = []
     for p in mx.projects():
-        projsetting = getattr(p, 'jacoco', '')
-        if not _jacoco_is_package_whitelisted(p.name):
-            baseExcludes.append(p.name)
-        elif projsetting == 'exclude':
-            baseExcludes.append(p.name)
-        elif projsetting == 'include':
-            includes.append(p.name + '.*')
+        if p.isJavaProject():
+            projsetting = getattr(p, 'jacoco', '')
+            if not _jacoco_is_package_whitelisted(p.name):
+                pass
+            elif projsetting == 'exclude':
+                baseExcludes.append(p.name)
+            elif projsetting == 'include':
+                includes.append(p.name + '.*')
+    if _jacoco_whitelisted_packages:
+        includes.extend((x + '.*' for x in _jacoco_whitelisted_packages))
 
     def _filter(l):
         # filter out specific classes which are already covered by a baseExclude package
@@ -625,7 +636,7 @@ def _jacoco_excludes_includes():
 
     excludes = []
     for p in mx.projects():
-        if p.isJavaProject():
+        if p.isJavaProject() and p.name not in baseExcludes and _jacoco_is_package_whitelisted(p.name):
             excludes += _filter(
                 p.find_classes_with_annotations(None, _jacoco_excluded_annotations, includeInnerClasses=True,
                                                 includeGenSrc=True).keys())
@@ -635,23 +646,24 @@ def _jacoco_excludes_includes():
     excludes += [package + '.*' for package in baseExcludes]
     return excludes, includes
 
+def get_jacoco_agent_path():
+    return mx.library('JACOCOAGENT_0.8.2', True).get_path(True)
+
 def get_jacoco_agent_args():
     '''
     Gets the args to be added to a VM command line for injecting the JaCoCo agent
     if use of JaCoCo has been requested otherwise returns None.
     '''
-    if _jacoco == 'on' or _jacoco == 'append':
-        jacocoagent = mx.library('JACOCOAGENT_0.8.2', True)
-
+    if _jacoco in ('on', 'append'):
         excludes, includes = _jacoco_excludes_includes()
         agentOptions = {
                         'append' : 'true' if _jacoco == 'append' else 'false',
                         'inclbootstrapclasses' : 'true',
                         'includes' : ':'.join(includes),
                         'excludes' : ':'.join(excludes),
-                        'destfile' : 'jacoco.exec'
+                        'destfile' : JACOCO_EXEC,
         }
-        return ['-javaagent:' + jacocoagent.get_path(True) + '=' + ','.join([k + '=' + v for k, v in agentOptions.items()])]
+        return ['-javaagent:' + get_jacoco_agent_path() + '=' + ','.join([k + '=' + v for k, v in agentOptions.items()])]
     return None
 
 def jacocoreport(args):
@@ -675,15 +687,17 @@ def jacocoreport(args):
     includedirs = []
     for p in mx.projects():
         projsetting = getattr(p, 'jacoco', '')
-        if (projsetting == 'include' or projsetting == '') and _jacoco_is_package_whitelisted(p.name):
+        if projsetting in ('include', '') and _jacoco_is_package_whitelisted(p.name):
             if isinstance(p, mx.ClasspathDependency):
+                if args.omit_excluded and p.is_test_project(): # skip test projects when omit-excluded
+                    continue
                 source_dirs = []
                 if p.isJavaProject():
                     source_dirs += p.source_dirs() + [p.source_gen_dir()]
                 includedirs.append(":".join([p.dir, p.classpath_repr(jdk)] + source_dirs))
 
     def _run_reporter(extra_args=None):
-        mx.run_java(['-cp', mx.classpath([dist_name], jdk=jdk), '-jar', dist.path, '--in', 'jacoco.exec', '--out',
+        mx.run_java(['-cp', mx.classpath([dist_name], jdk=jdk), '-jar', dist.path, '--in', JACOCO_EXEC, '--out',
                      args.output_directory, '--format', args.format] +
                     (extra_args or []) +
                     sorted(includedirs),
@@ -697,3 +711,285 @@ def jacocoreport(args):
             fp.writelines((e + "\n" for e in excludes))
             fp.flush()
             _run_reporter(['--exclude-file', fp.name])
+
+
+def _parse_java_properties(args):
+    prop_re = re.compile('-D(?P<key>[^=]+)=(?P<value>.*)')
+    remainder = []
+    java_properties = {}
+    for arg in args:
+        m = prop_re.match(arg)
+        if m:
+            java_properties[m.group('key')] = m.group('value')
+        else:
+            remainder.append(arg)
+    return java_properties, remainder
+
+
+def _jacoco_excludes_includes_projects(limit_to_primary=False):
+    includes = []
+    excludes = []
+
+    projects = mx.projects(limit_to_primary=limit_to_primary)
+    for p in projects:
+        if p.isJavaProject():
+            projsetting = getattr(p, 'jacoco', '')
+            if not _jacoco_is_package_whitelisted(p.name):
+                excludes.append(p)
+            elif projsetting == 'exclude':
+                excludes.append(p)
+            else:
+                includes.append(p)
+    return excludes, includes
+
+def _jacoco_exclude_classes(projects):
+    excludeClasses = {}
+
+    for p in projects:
+        r = p.find_classes_with_annotations(None, _jacoco_excluded_annotations, includeGenSrc=True)
+        excludeClasses.update(r)
+        r = p.find_classes_with_matching_source_line(None, lambda line: 'JaCoCo Exclude' in line, includeGenSrc=True)
+        excludeClasses.update(r)
+    return excludeClasses
+
+def coverage_upload(args):
+    parser = ArgumentParser(prog='mx coverage-upload')
+    parser.add_argument('--upload-url', required=False, default=mx.get_env('COVERAGE_UPLOAD_URL'), help='Format is like rsync: user@host:/directory')
+    parser.add_argument('--build-name', required=False, default=mx.get_env('BUILD_NAME'))
+    parser.add_argument('--build-url', required=False, default=mx.get_env('BUILD_URL'))
+    parser.add_argument('--build-number', required=False, default=mx.get_env('BUILD_NUMBER'))
+    args, other_args = parser.parse_known_args(args)
+    if not args.upload_url:
+        parser.print_help()
+        return
+    remote_host, remote_basedir = args.upload_url.split(':')
+    if not remote_host:
+        mx.abort('Cannot determine remote host from {}'.format(args.upload_url))
+
+    primary = mx.primary_suite()
+    info = primary.vc.parent_info(primary.dir)
+    rev = primary.vc.parent(primary.dir)
+    if len(remote_basedir) > 0 and not remote_basedir.endswith('/'):
+        remote_basedir += '/'
+    remote_dir = '{}_{}_{}'.format(primary.name, datetime.datetime.fromtimestamp(info['author-ts']).strftime('%Y-%m-%d_%H_%M'), rev[:7])
+    if args.build_name:
+        remote_dir += '_' + args.build_name
+    if args.build_number:
+        remote_dir += '_' + args.build_number
+    upload_dir = remote_basedir + remote_dir
+    jacocoreport(['--omit-excluded'] + other_args)
+    files = [JACOCO_EXEC, 'coverage']
+    print("Syncing {} to {}:{}".format(" ".join(files), remote_host, upload_dir))
+    mx.run([
+        'bash',
+        '-c',
+        r'tar -czf - {files} | ssh {remote} bash -c \'"mkdir -p {remotedir} && cd {remotedir} && cat | tar -x{verbose}z"\''
+            .format(
+                files=" ".join(files),
+                remote=remote_host,
+                remotedir=upload_dir,
+                verbose='v' if mx._opts.verbose else '')
+    ])
+    def upload_string(content, path):
+        mx.run(['ssh', remote_host, 'bash', '-c', 'cat > "' + path + '"'], stdin=content)
+    upload_string(json.dumps({
+        'timestamp': time.time(),
+        'suite': primary.name,
+        'revision': rev,
+        'directory': remote_dir,
+        'build_name': args.build_name,
+        'build_url': args.build_url,
+        'build_number': args.build_number,
+        'primary_info': info}), upload_dir + '/description.json')
+    mx.run(['ssh', remote_host, 'bash', '-c', r'"(echo \[; for i in {remote_basedir}/*/description.json; do cat \$i; echo ,; done; echo null\]) > {remote_basedir}/index.json"'.format(remote_basedir=remote_basedir)])
+    upload_string("""<html>
+<frameset rows="40,*">
+  <frame id="navigation" src="navigation.html"/>
+  <frame id="content" src=""/>
+</frameset>
+</html>""", remote_basedir + '/index.html')
+    upload_string("""<html>
+    <head>
+        <script src="https://ajax.googleapis.com/ajax/libs/angularjs/1.7.7/angular.js"></script>
+        <script language="javascript">
+        var App = angular.module('myApp', [])
+            .controller('IndexCtrl', function IndexCtrl($scope, $http) {
+                var hash = parent.window.location.hash;
+                if(hash) {
+                    hash = hash.substring(1, hash.length); // remove leading hash
+                }
+                $http.get('index.json').then(function(response, status) {
+                    var data = response.data.filter(x => x != null);
+                    data.sort((l,r) => r.directory.localeCompare(l.directory));
+                    if(data.length > 0) {
+                        var startdir;
+                        if(hash) {
+                            startdir = data.find((dir) => dir.directory == hash);
+                        }
+                        if(!startdir) {
+                            startdir = data[0];
+                        }
+                        $scope.directory = startdir;
+                    }
+                    $scope.data = data;
+                });
+                $scope.$watch('directory', (dir, olddir) => {
+                    if(dir) {
+                        var content = parent.content.contentDocument;
+                        var newpath;
+                        if(olddir) {
+                            newpath = content.location.href.replace(olddir.directory, dir.directory);
+                        } else {
+                            newpath = dir.directory + "/coverage";
+                        }
+                        content.location.href = newpath;
+                        parent.window.history.replaceState(undefined, undefined, "#" + dir.directory);
+                    }
+                });
+                $scope.step = (i) => $scope.directory = $scope.data[$scope.data.indexOf($scope.directory)+i];
+            });
+        </script>
+    </head>
+    <body ng-app="myApp" ng-controller="IndexCtrl">
+       <button ng-click="step(1)" ng-disabled="data.indexOf(directory) >= data.length-1">&lt;&lt;</button>
+       <button ng-click="step(-1)" ng-disabled="data.indexOf(directory) <= 0">&gt;&gt;</button>
+       <select ng-model="directory" ng-options="(i.primary_info['author-ts']*1000|date:'yy-MM-dd hh:mm') + ' ' + i.build_name + ' ' + i.build_number group by i.suite for i in data"></select>
+       <a href="{{directory.build_url}}" ng-if="directory.build_url">Build</a> Commit: {{directory.revision.substr(0,5)}}: {{directory.primary_info.description}}
+    </body>
+</html>""", remote_basedir + '/navigation.html')
+
+def sonarqube_upload(args):
+    """run SonarQube scanner and upload JaCoCo results"""
+
+    sonarqube_cli = mx.library("SONARSCANNER_CLI_3_3_0_1492", True)
+
+    parser = ArgumentParser(prog='mx sonarqube-upload')
+    parser.add_argument('--exclude-generated', action='store_true', help='Exclude generated source files')
+    parser.add_argument('--skip-coverage', action='store_true', default=False, help='Do not upload coverage reports')
+    args, sonar_args = mx.extract_VM_args(args, useDoubleDash=True, defaultAllVMArgs=True)
+    args, other_args = parser.parse_known_args(args)
+    java_props, other_args = _parse_java_properties(other_args)
+
+    def _check_required_prop(prop):
+        if prop not in java_props:
+            mx.abort("Required property '{prop}' not present. (Format is '-D{prop}=<value>')".format(prop=prop))
+
+    _check_required_prop('sonar.projectKey')
+    _check_required_prop('sonar.host.url')
+
+    basedir = mx.primary_suite().dir
+
+    # collect excluded projects
+    excludes, includes = _jacoco_excludes_includes_projects(limit_to_primary=True)
+    # collect excluded classes
+    exclude_classes = _jacoco_exclude_classes(includes)
+    java_bin = []
+    java_src = []
+    java_libs = []
+
+    def _visit_deps(dep, edge):
+        if dep.isJARDistribution() or dep.isLibrary():
+            java_libs.append(dep.classpath_repr())
+
+    mx.walk_deps(includes, visit=_visit_deps)
+
+    # collect all sources and binaries -- do exclusion later
+    for p in includes:
+        java_src.extend(p.source_dirs())
+        if not args.exclude_generated:
+            gen_dir = p.source_gen_dir()
+            if os.path.exists(gen_dir):
+                java_src.append(gen_dir)
+        java_bin.append(p.output_dir())
+
+    java_src = [os.path.relpath(s, basedir) for s in java_src]
+    java_bin = [os.path.relpath(b, basedir) for b in java_bin]
+
+    # Overlayed sources and classes must be excluded
+    jdk_compliance = mx.get_jdk().javaCompliance
+    overlayed_sources = []
+    overlayed_classfiles = {}
+    for p in includes:
+        if hasattr(p, "multiReleaseJarVersion") and jdk_compliance not in p.javaCompliance: # JDK9+ overlays
+            for srcDir in p.source_dirs():
+                for root, _, files in os.walk(srcDir):
+                    for name in files:
+                        if name.endswith('.java') and name != 'package-info.java':
+                            overlayed_sources.append(join(os.path.relpath(root, basedir), name))
+        elif hasattr(p, "overlayTarget"): # JDK8 overlays
+            target = mx.project(p.overlayTarget)
+            overlay_sources = []
+            for srcDir in p.source_dirs():
+                for root, _, files in os.walk(srcDir):
+                    for name in files:
+                        if name.endswith('.java') and name != 'package-info.java':
+                            overlay_sources.append(join(os.path.relpath(root, srcDir), name))
+            print(p, target, overlay_sources)
+            for srcDir in target.source_dirs():
+                for root, _, files in os.walk(srcDir):
+                    for name in files:
+                        if name.endswith('.java') and name != 'package-info.java':
+                            s = join(os.path.relpath(root, srcDir), name)
+                            if s in overlay_sources:
+                                overlayed = join(os.path.relpath(root, basedir), name)
+                                overlayed_sources.append(overlayed)
+            for s in overlay_sources:
+                classfile = join(os.path.relpath(target.output_dir(), basedir), s[:-len('java')] + 'class')
+                with open(classfile, 'rb') as fp:
+                    overlayed_classfiles[classfile] = fp.read()
+
+    exclude_dirs = []
+    for p in excludes:
+        exclude_dirs.extend(p.source_dirs())
+        exclude_dirs.append(p.source_gen_dir())
+
+    javaCompliance = max([p.javaCompliance for p in includes]) if includes else mx.JavaCompliance('1.7')
+
+    jacoco_exec = JACOCO_EXEC
+    if not os.path.exists(jacoco_exec) and not args.skip_coverage:
+        mx.abort('No JaCoCo report file found: ' + jacoco_exec)
+
+    def _add_default_prop(key, value):
+        if key not in java_props:
+            java_props[key] = value
+
+    # default properties
+    _add_default_prop('sonar.java.source', str(javaCompliance))
+    _add_default_prop('sonar.projectBaseDir', basedir)
+    if not args.skip_coverage:
+        _add_default_prop('sonar.jacoco.reportPaths', jacoco_exec)
+    _add_default_prop('sonar.sources', ','.join(java_src))
+    _add_default_prop('sonar.java.binaries', ','.join(java_bin))
+    _add_default_prop('sonar.java.libraries', ','.join(java_libs))
+    exclude_patterns = [os.path.relpath(e, basedir) + '**' for e in exclude_dirs] + \
+                       overlayed_sources + \
+                       list(set([os.path.relpath(match[0], basedir) for _, match in exclude_classes.iteritems()]))
+    if exclude_patterns:
+        _add_default_prop('sonar.exclusions', ','.join(exclude_patterns))
+        _add_default_prop('sonar.coverage.exclusions', ','.join(exclude_patterns))
+    _add_default_prop('sonar.verbose', 'true' if mx._opts.verbose else 'false')
+
+    with tempfile.NamedTemporaryFile(suffix="-sonarqube.properties", mode="w+") as fp:
+        # prepare properties file
+        fp.writelines(('{}={}\n'.format(k, v) for k, v in java_props.iteritems()))
+        fp.flush()
+
+        # Since there's no options to exclude individual classes,
+        # we temporarily delete the overlayed class files instead.
+        for classfile in overlayed_classfiles:
+            os.remove(classfile)
+
+        try:
+            # run sonarqube cli
+            java_args = other_args + ['-Dproject.settings=' + fp.name, '-jar', sonarqube_cli.get_path(True)] + sonar_args
+            exit_code = mx.run_java(java_args, nonZeroIsFatal=False)
+        finally:
+            # Restore temporarily deleted class files
+            for classfile, data in overlayed_classfiles.items():
+                with open(classfile, 'wb') as cf:
+                    cf.write(data)
+
+        if exit_code != 0:
+            fp.seek(0)
+            mx.abort('SonarQube scanner terminated with non-zero exit code: {}\n  Properties file:\n{}'.format(
+                exit_code, ''.join(('    ' + l for l in fp.readlines()))))

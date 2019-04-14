@@ -202,6 +202,7 @@ add_parser("jmh_jar_benchmark_suite_vm", ParserEntry(
 ))
 get_parser("jmh_jar_benchmark_suite_vm").add_argument("--jmh-jar", default=None)
 get_parser("jmh_jar_benchmark_suite_vm").add_argument("--jmh-name", default=None)
+get_parser("jmh_jar_benchmark_suite_vm").add_argument("--jmh-benchmarks", default=None)
 
 
 class BenchmarkSuite(object):
@@ -210,6 +211,10 @@ class BenchmarkSuite(object):
 
     A suite needs to be registered with mx_benchmarks.add_bm_suite.
     """
+    def __init__(self, *args, **kwargs):
+        super(BenchmarkSuite, self).__init__(*args, **kwargs)
+        self._suite_dimensions = {}
+
     def name(self):
         """Returns the name of the suite.
 
@@ -258,7 +263,6 @@ class BenchmarkSuite(object):
         Can be overridden to check for existence of required environment variables
         before the benchmark suite executed.
         """
-        pass
 
     def vmArgs(self, bmSuiteArgs):
         """Extracts the VM flags from the list of arguments passed to the suite.
@@ -285,7 +289,6 @@ class BenchmarkSuite(object):
 
         Arguments: see `run`.
         """
-        pass
 
     def after(self, bmSuiteArgs):
         """Called exactly once after all benchmark invocations are done.
@@ -294,7 +297,6 @@ class BenchmarkSuite(object):
 
         Arguments: see `run`.
         """
-        pass
 
     def parserNames(self):
         """Returns the list of parser names that this benchmark suite uses.
@@ -304,6 +306,14 @@ class BenchmarkSuite(object):
         :rtype: list[str]
         """
         return []
+
+    def suiteDimensions(self):
+        """Returns context specific dimensions that will be integrated in the measurement
+        data.
+
+        :rtype: dict
+        """
+        return self._suite_dimensions
 
     def run(self, benchmarks, bmSuiteArgs):
         """Runs the specified benchmarks with the given arguments.
@@ -377,7 +387,7 @@ def bm_suite_valid_keys():
 
 def vm_registries():
     res = set()
-    for bm_suite in _bm_suites.itervalues():
+    for bm_suite in _bm_suites.values():
         if isinstance(bm_suite, VmBenchmarkSuite):
             res.add(bm_suite.get_vm_registry())
     return res
@@ -471,7 +481,7 @@ class BaseRule(Rule):
         varpat = re.compile(r"\$([a-zA-Z_][0-9a-zA-Z_]*)")
         for iteration, m in enumerate(self.parseResults(text)):
             datapoint = {}
-            for key, value in self.replacement.iteritems():
+            for key, value in self.replacement.items():
                 inst = value
                 if isinstance(inst, tuple):
                     v, vtype = inst
@@ -488,8 +498,6 @@ class BaseRule(Rule):
                         inst = str(v)
                     elif vtype is int:
                         inst = int(v)
-                    elif vtype is long:
-                        inst = long(v)
                     elif vtype is float:
                         inst = float(v)
                     elif vtype is bool:
@@ -498,8 +506,9 @@ class BaseRule(Rule):
                         inst = vtype(v)
                     else:
                         raise RuntimeError("Cannot handle object '{0}' of expected type {1}".format(v, vtype))
-                if not isinstance(inst, (str, int, long, float, bool)):
-                    raise RuntimeError("Object '{0}' has unknown type: {1}".format(inst, type(inst)))
+                if not isinstance(inst, (str, int, float, bool)):
+                    if type(inst).__name__ != 'long': # Python2: int(x) can result in a long
+                        raise RuntimeError("Object '{}' has unknown type: {}".format(inst, type(inst)))
                 datapoint[key] = inst
             datapoints.append(datapoint)
         return datapoints
@@ -680,9 +689,9 @@ class JMHJsonRule(Rule):
 
                 if "params" in result:
                     # add all parameter as a single string
-                    d["extra.jmh.params"] = ", ".join(["=".join(kv) for kv in result["params"].iteritems()])
+                    d["extra.jmh.params"] = ", ".join(["=".join(kv) for kv in result["params"].items()])
                     # and also the individual values
-                    for k, v in result["params"].iteritems():
+                    for k, v in result["params"].items():
                         d["extra.jmh.param." + k] = str(v)
 
                 for k in self.getExtraJmhKeys():
@@ -757,7 +766,6 @@ class StdOutBenchmarkSuite(BenchmarkSuite):
         The `error` field of each datapoint should not be modified in this benchmark,
         as it will be overwritten with the appropriate error message.
         """
-        pass
 
     def repairDatapointsAndFail(self, benchmarks, bmSuiteArgs, partialResults, message):
         self.repairDatapoints(benchmarks, bmSuiteArgs, partialResults)
@@ -1065,6 +1073,7 @@ class JavaBenchmarkSuite(VmBenchmarkSuite): #pylint: disable=R0922
     to extract the `--jvm-config` and the VM-and-run arguments to the benchmark suite
     (see the `benchmark` method for more information).
     """
+
     def createCommandLineArgs(self, benchmarks, bmSuiteArgs):
         """Creates a list of arguments for the JVM using the suite arguments.
 
@@ -1097,7 +1106,17 @@ class JavaBenchmarkSuite(VmBenchmarkSuite): #pylint: disable=R0922
     def before(self, bmSuiteArgs):
         super(JavaBenchmarkSuite, self).before(bmSuiteArgs)
         with mx.DisableJavaDebugging():
-            self.getJavaVm(bmSuiteArgs).run(".", ["-version"])
+            code, out, _ = self.getJavaVm(bmSuiteArgs).run(".", ["-version"])
+            if code == 0:
+                output_lines = out.splitlines()
+                assert "version" in output_lines[0]
+                assert len(output_lines) >= 3
+                jdk_version_number = output_lines[0].split("\"")[1]
+                jdk_major_version = mx.JavaCompliance(jdk_version_number).value
+                jdk_version_string = output_lines[2]
+                self._suite_dimensions["platform.jdk-version-number"] = jdk_version_number
+                self._suite_dimensions["platform.jdk-major-version"] = jdk_major_version
+                self._suite_dimensions["platform.jdk-version-string"] = jdk_version_string
 
 
 class Vm(object): #pylint: disable=R0922
@@ -1239,8 +1258,6 @@ class DummyJavaVm(OutputCapturingJavaVm):
     Note that the warning R0921 (abstract-class-little-used) has been removed
     from pylint 1.4.3.
     """
-    pass
-
 
 def add_java_vm(javavm, suite=None, priority=0):
     java_vm_registry.add_vm(javavm, suite, priority)
@@ -1370,7 +1387,7 @@ class JMHRunnerBenchmarkSuite(JMHBenchmarkSuiteBase): #pylint: disable=too-many-
 
     def benchmarkList(self, bmSuiteArgs):
         """Return all different JMH versions found."""
-        return list(JMHRunnerBenchmarkSuite.get_jmh_projects_dict().iterkeys())
+        return list(JMHRunnerBenchmarkSuite.get_jmh_projects_dict().keys())
 
     def createCommandLineArgs(self, benchmarks, bmSuiteArgs):
         if benchmarks is None:
@@ -1394,7 +1411,7 @@ class JMHRunnerBenchmarkSuite(JMHBenchmarkSuiteBase): #pylint: disable=too-many-
         jmhProjects = {}
         projects = mx.projects_opt_limit_to_suites()
         if mx.primary_suite() == mx._mx_suite:
-            projects = [p for p in mx._projects.itervalues() if p.suite == mx._mx_suite]
+            projects = [p for p in mx._projects.values() if p.suite == mx._mx_suite]
         for p in projects:
             for x in p.deps:
                 if x.name.startswith('JMH'):
@@ -1423,7 +1440,7 @@ class JMHJarBenchmarkSuite(JMHBenchmarkSuiteBase):
         jvm = self.getJavaVm(bmSuiteArgs)
         cwd = self.workingDirectory(benchmarks, bmSuiteArgs)
         args = self.createCommandLineArgs(benchmarks, bmSuiteArgs)
-        _, out, _ = jvm.run(cwd, args + ["-l"])
+        _, out, _ = jvm.run(cwd, args + self.jmhBenchmarkFilter(bmSuiteArgs) + ["-l"])
         benchs = out.splitlines()
         linenumber = -1
         for linenumber in range(len(benchs)):
@@ -1451,6 +1468,11 @@ class JMHJarBenchmarkSuite(JMHBenchmarkSuiteBase):
         if jmh_name is None:
             mx.abort("Please use the --jmh-name benchmark suite argument to set the name of the JMH suite.")
         return jmh_name
+
+    def jmhBenchmarkFilter(self, bmSuiteArgs):
+        jmh_benchmarks = self.jmhArgs(bmSuiteArgs).jmh_benchmarks
+        jmh_benchmarks = jmh_benchmarks if jmh_benchmarks is not None else ""
+        return jmh_benchmarks.split(',')
 
     def jmhJAR(self, bmSuiteArgs):
         jmh_jar = self.jmhArgs(bmSuiteArgs).jmh_jar
@@ -1639,7 +1661,6 @@ class BenchmarkExecutor(object):
           "config.vm-flags": " ".join(suite.vmArgs(bmSuiteArgs)),
           "config.run-flags": " ".join(suite.runArgs(bmSuiteArgs)),
           "config.build-flags": self.buildFlags(),
-          "config.platform-version": "",
           "machine.name": self.machineName(mxBenchmarkArgs),
           "machine.node": self.machineNode(mxBenchmarkArgs),
           "machine.hostname": self.machineHostname(),
@@ -1657,6 +1678,7 @@ class BenchmarkExecutor(object):
           "warnings": "",
         }
 
+        standard.update(suite.suiteDimensions())
         standard.update(self.extras(mxBenchmarkArgs))
 
         def commit_info(prefix, mxsuite):
@@ -1796,7 +1818,7 @@ class BenchmarkExecutor(object):
             help="Print the list of all available benchmark suites or all benchmarks available in a suite.")
         parser.add_argument(
             "--fork-count-file", default=None,
-            help="Path to the file that lists the number of re-executions for the targetted benchmarks, using the JSON format: { (<name>: <count>,)* }")
+            help="Path to the file that lists the number of re-executions for the targeted benchmarks, using the JSON format: { (<name>: <count>,)* }")
         parser.add_argument(
             "-h", "--help", action="store_true", default=None,
             help="Show usage information.")
@@ -1825,7 +1847,7 @@ class BenchmarkExecutor(object):
                         vmregToSuites.setdefault(vmreg, []).append(bm_suite_name)
                     else:
                         noVmRegSuites.append(bm_suite_name)
-                for vmreg, bm_suite_names in vmregToSuites.iteritems():
+                for vmreg, bm_suite_names in vmregToSuites.items():
                     print("\nThe following {} benchmark suites are available:\n".format(vmreg.vm_type_name))
                     for name in bm_suite_names:
                         print("  " + name)
@@ -1838,7 +1860,7 @@ class BenchmarkExecutor(object):
 
         if mxBenchmarkArgs.help or mxBenchmarkArgs.benchmark is None:
             parser.print_help()
-            for key, entry in parsers.iteritems():
+            for key, entry in parsers.items():
                 if mxBenchmarkArgs.benchmark is None or key in suite.parserNames():
                     print(entry.description)
                     entry.parser.print_help()
@@ -1853,10 +1875,10 @@ class BenchmarkExecutor(object):
         # The fork-counts file can be used to specify how many times to repeat the whole fork of the benchmark.
         # For simplicity, this feature is only supported if the benchmark harness invokes each benchmark in the suite separately
         # (i.e. when the harness does not ask the suite to run a set of benchmarks within the same process).
-        fork_counts = None
+        fork_count_spec = None
         if mxBenchmarkArgs.fork_count_file:
             with open(mxBenchmarkArgs.fork_count_file) as f:
-                fork_counts = json.load(f)
+                fork_count_spec = json.load(f)
         failures_seen = False
         try:
             suite.before(bmSuiteArgs)
@@ -1864,11 +1886,16 @@ class BenchmarkExecutor(object):
             for benchnames in benchNamesList:
                 suite.validateEnvironment()
                 fork_count = 1
-                if benchnames and len(benchnames) == 1 and fork_counts:
-                    fork_count = fork_counts.get("{}:{}".format(suite.name(), benchnames[0]), fork_counts.get(benchnames[0], 1))
-                elif fork_counts:
+                if fork_count_spec and benchnames and len(benchnames) == 1:
+                    fork_count = fork_count_spec.get("{}:{}".format(suite.name(), benchnames[0]), fork_count_spec.get(benchnames[0], 1))
+                elif fork_count_spec and len(suite.benchmarkList(bmSuiteArgs)) == 1:
+                    # single benchmark suites executed by providing the suite name only or a wildcard
+                    fork_count = fork_count_spec.get(suite.name(), fork_count_spec.get("{}:*".format(suite.name()), 1))
+                elif fork_count_spec:
                     mx.abort("The fork-count feature is only supported when the suite is asked to run a single benchmark within a fork.")
-                for _ in range(0, fork_count):
+                for fork_num in range(0, fork_count):
+                    if fork_count_spec:
+                        mx.log("Execution of fork {}/{}".format(fork_num + 1, fork_count))
                     try:
                         partialResults = self.execute(
                             suite, benchnames, mxBenchmarkArgs, bmSuiteArgs)

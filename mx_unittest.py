@@ -1,4 +1,3 @@
-#!/usr/bin/env python2.7
 #
 # ----------------------------------------------------------------------------------------------------
 #
@@ -187,14 +186,14 @@ def _run_tests(args, harness, vmLauncher, annotations, testfile, blacklist, whit
                 mx.abort("Method specification is class#method: " + tests[0])
             t, method = words
 
-            for c, p in candidates.iteritems():
+            for c, p in candidates.items():
                 # prefer exact matches first
                 if t == c:
                     found = True
                     classes.append(c)
                     depsContainingTests.add(p)
             if not found:
-                for c, p in candidates.iteritems():
+                for c, p in candidates.items():
                     if t in c:
                         found = True
                         classes.append(c)
@@ -209,7 +208,7 @@ def _run_tests(args, harness, vmLauncher, annotations, testfile, blacklist, whit
             for t in tests:
                 if '#' in t:
                     mx.abort('Method specifications can only be used in a single test: ' + t)
-                for c, p in candidates.iteritems():
+                for c, p in candidates.items():
                     if t in c:
                         found = True
                         classes.append(c)
@@ -262,7 +261,7 @@ def set_vm_launcher(name, launcher, jdk=None):
 def add_config_participant(p):
     _config_participants.append(p)
 
-def _unittest(args, annotations, junit_args, prefixCp="", blacklist=None, whitelist=None, regex=None, suite=None, record_results=False):
+def _unittest(args, annotations, junit_args, prefixCp="", blacklist=None, whitelist=None, regex=None, suite=None):
     testfile = os.environ.get('MX_TESTFILE', None)
     if testfile is None:
         (_, testfile) = tempfile.mkstemp(".testclasses", "mxtool")
@@ -392,7 +391,7 @@ def unittest(args):
     parser.add_argument('--regex', help='run only testcases matching a regular expression', metavar='<regex>')
     parser.add_argument('--color', help='enable color output', dest='JUnitColor', action=MxJUnitWrapperBoolArg)
     parser.add_argument('--gc-after-test', help='force a GC after each test', dest='JUnitGCAfterTest', action=MxJUnitWrapperBoolArg)
-    parser.add_argument('--record-results', help='record test class results to passed.txt and failed.txt', action='store_true')
+    parser.add_argument('--record-results', help='record test class results to passed.txt and failed.txt', dest='JUnitRecordResults', action=MxJUnitWrapperBoolArg)
     parser.add_argument('--suite', help='run only the unit tests in <suite>', metavar='<suite>')
     parser.add_argument('--repeat', help='run each test <n> times', dest='JUnitRepeat', action=MxJUnitWrapperArg, type=is_strictly_positive, metavar='<n>')
     eagerStacktrace = parser.add_mutually_exclusive_group()

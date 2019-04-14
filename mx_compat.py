@@ -26,7 +26,7 @@
 
 from __future__ import print_function
 
-import sys, inspect, re, types, bisect
+import sys, inspect, re, bisect
 from collections import OrderedDict
 from os.path import join
 import mx
@@ -175,6 +175,18 @@ class MxCompatibility500(object):
         Should sanity check Checkstyle configuration for a project.
         """
         return False
+
+    def verify_multirelease_projects(self):
+        """
+        Should multi-release projects be verified (see mx.verifyMultiReleaseProjects).
+        """
+        return False
+
+    def spotbugs_version(self):
+        """
+        Which version of findbugs/spotbugs should be used?
+        """
+        return "3.0.0"
 
 class MxCompatibility520(MxCompatibility500):
     @staticmethod
@@ -393,15 +405,31 @@ class MxCompatibility51951(MxCompatibility51950):  # pylint: disable=too-many-an
     def check_checkstyle_config(self):
         return True
 
+class MxCompatibility52061(MxCompatibility51951):  # pylint: disable=too-many-ancestors
+    @staticmethod
+    def version():
+        return mx.VersionSpec("5.206.1")
+
+    def verify_multirelease_projects(self):
+        return True
+
+class MxCompatibility52102(MxCompatibility52061):  # pylint: disable=too-many-ancestors
+    @staticmethod
+    def version():
+        return mx.VersionSpec("5.210.2")
+
+    def spotbugs_version(self):
+        return "3.1.11"
+
 def minVersion():
     _ensureCompatLoaded()
-    return _versionsMap.keys()[0]
+    return list(_versionsMap)[0]
 
 def getMxCompatibility(version):
     """:rtype: MxCompatibility500"""
     if version < minVersion():  # ensures compat loaded
         return None
-    keys = _versionsMap.keys()
+    keys = list(_versionsMap.keys())
     return _versionsMap[keys[bisect.bisect_right(keys, version)-1]]
 
 _versionsMap = OrderedDict()
@@ -411,12 +439,12 @@ def _ensureCompatLoaded():
 
         def flattenClassTree(tree):
             root = tree[0][0]
-            assert isinstance(root, types.TypeType), root
+            assert isinstance(root, type), root
             yield root
             if len(tree) > 1:
                 assert len(tree) == 2
                 rest = tree[1]
-                assert isinstance(rest, types.ListType), rest
+                assert isinstance(rest, list), rest
                 for c in flattenClassTree(rest):
                     yield c
 

@@ -1,6 +1,6 @@
 # ----------------------------------------------------------------------------------------------------
 #
-# Copyright (c) 2018, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
 # DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
 #
 # This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@ import abc
 import collections
 import errno
 import filecmp
+import itertools
 import os
 import subprocess
 import sys
@@ -73,7 +74,7 @@ class Ninja(object):
 
         self._run('-n', '-d', 'explain', out=out, err=details)
         if details.lines:
-            return True, details.lines[0]
+            return True, [l for l in details.lines if l.startswith('ninja explain:')][0]
         else:
             assert out.lines == ['ninja: no work to do.']
             return False, out.lines[0]
@@ -107,10 +108,23 @@ class Ninja(object):
             os.chmod(self.binary, 0o755)
             self._run(*args, **kwargs)  # retry
         else:
-            not rc or mx.abort(rc)  # pylint: disable=expression-not-assigned
+            not rc or mx.abort(rc if mx.get_opts().verbose else out.data)  # pylint: disable=expression-not-assigned
 
 
-class NinjaProject(mx.AbstractNativeProject):
+class NativeDependency(mx.Dependency):
+    """A Dependency that can be included and linked in when building native projects.
+
+    Attributes
+        include_dirs : iterable of str
+            Directories with headers provided by this dependency.
+        libs : iterable of str
+            Libraries provided by this dependency.
+    """
+    include_dirs = ()
+    libs = ()
+
+
+class NinjaProject(mx.AbstractNativeProject, NativeDependency):
     """A Project containing native code that is built using the Ninja build system.
 
     What distinguishes Ninja from other build systems is that its input files are
@@ -125,15 +139,24 @@ class NinjaProject(mx.AbstractNativeProject):
             Flags used during compilation step.
         ldflags : list of str, optional
             Flags used during linking step.
+        ldlibs : list of str, optional
+            Flags used during linking step.
+        use_jdk_headers : bool, optional
+            Whether to add directories with JDK headers to the list of directories
+            searched for header files. Default is False.
+
+            The use of JDK headers is implied if any build dependency is a Java
+            project with JNI headers.
     """
 
-    def __init__(self, suite, name, subDir, srcDirs, deps, workingSets, d, theLicense, **kwargs):
+    def __init__(self, suite, name, subDir, srcDirs, deps, workingSets, d, **kwargs):
         context = 'project ' + name
-        self.buildDependencies = mx.Suite._pop_list(kwargs, 'buildDependencies', context) + self._ninja_deps
         self._cflags = mx.Suite._pop_list(kwargs, 'cflags', context)
         self._ldflags = mx.Suite._pop_list(kwargs, 'ldflags', context)
-        super(NinjaProject, self).__init__(suite, name, subDir, srcDirs, deps, workingSets, d, theLicense,
-                                           **kwargs)
+        self._ldlibs = mx.Suite._pop_list(kwargs, 'ldlibs', context)
+        self.use_jdk_headers = kwargs.pop('use_jdk_headers', False)
+        super(NinjaProject, self).__init__(suite, name, subDir, srcDirs, deps, workingSets, d, **kwargs)
+        self.buildDependencies += self._ninja_deps
         self.out_dir = self.get_output_root()
 
     @lazy_class_default
@@ -143,12 +166,16 @@ class NinjaProject(mx.AbstractNativeProject):
         try:
             subprocess.check_output(['ninja', '--version'], stderr=subprocess.STDOUT)
         except OSError:
-            dep = mx.library('NINJA')
-            deps.append(dep.qualifiedName())
-            Ninja.binary = mx.join(dep.get_path(False), 'ninja')
+            dep = mx.library('NINJA', False)
+            if dep:
+                deps.append(dep.qualifiedName())
+                Ninja.binary = mx.join(dep.get_path(False), 'ninja')
+            else:
+                # necessary until GR-13214 is resolved
+                mx.warn('Make `ninja` binary available via PATH to build native projects.')
 
         try:
-            import ninja_syntax  # pylint: disable=unused-variable
+            import ninja_syntax  # pylint: disable=unused-variable, unused-import
         except ImportError:
             def raise_(e):
                 raise e
@@ -161,6 +188,26 @@ class NinjaProject(mx.AbstractNativeProject):
             sys.path.append(module_path)
 
         return deps
+
+    def resolveDeps(self):
+        super(NinjaProject, self).resolveDeps()
+        if self.use_jdk_headers or any(d.isJavaProject() and d.include_dirs for d in self.buildDependencies):
+            self.buildDependencies += [self._jdk_dep]
+
+    @lazy_class_default
+    def _jdk_dep(cls):  # pylint: disable=no-self-argument
+        class JavaHome(NativeDependency):
+            def __init__(self, jdk):
+                super(JavaHome, self).__init__(mx.suite('mx'), 'JAVA_HOME=' + jdk.home, None)
+                self.include_dirs = jdk.include_dirs
+
+            def getBuildTask(self, args):
+                return mx.NoOpTask(self, args)
+
+            def _walk_deps_visit_edges(self, *args, **kwargs):
+                pass
+
+        return JavaHome(mx.get_jdk(tag=mx.DEFAULT_JDK_TAG))
 
     def getBuildTask(self, args):
         return NinjaBuildTask(args, self)
@@ -176,6 +223,10 @@ class NinjaProject(mx.AbstractNativeProject):
     @property
     def ldflags(self):
         return self._ldflags
+
+    @property
+    def ldlibs(self):
+        return self._ldlibs
 
     @property
     def source_tree(self):
@@ -212,22 +263,17 @@ class NinjaBuildTask(mx.AbstractNativeBuildTask):
         return 'Building {} with Ninja'.format(self.subject.name)
 
     def needsBuild(self, newestInput):
+        is_needed, self._reason = super(NinjaBuildTask, self).needsBuild(newestInput)
+        if is_needed:
+            return True, self._reason
+
         if not mx.exists(self._manifest):
             self._reason = 'no build manifest'
             return True, self._reason
 
         mx.logv('Checking whether to build {} with Ninja...'.format(self.subject.name))
-
         is_needed, self._reason = self.ninja.needs_build()
-        if is_needed:
-            return True, self._reason
-
-        is_forced, reason = super(NinjaBuildTask, self).needsBuild(newestInput)
-        if is_forced:
-            self._reason = reason
-            return True, self._reason
-
-        return False, self._reason
+        return is_needed, self._reason
 
     def newestOutput(self):
         return mx.TimeStampFile.newest([mx.join(self.subject.out_dir, self.subject._target)])
@@ -288,33 +334,61 @@ class NinjaManifestGenerator(object):
         self.newline()
 
     def include(self, dirs):
-        self.variables(includes=['-I' + self._resolve(d) for d in dirs])
+        def quote(path):
+            return '"{}"'.format(path) if mx.is_windows() and ' ' in path else path
 
-    def cc_rule(self):
-        if mx.get_os() == 'windows':
+        self.variables(includes=['-I' + quote(self._resolve(d)) for d in dirs])
+
+    def cc_rule(self, cxx=False):
+        if mx.is_windows():
             command = 'cl -nologo -showIncludes $includes $cflags -c $in -Fo$out'
             depfile = None
             deps = 'msvc'
         else:
-            command = 'gcc -MMD -MF $out.d $includes $cflags -c $in -o $out'
+            command = '%s -MMD -MF $out.d $includes $cflags -c $in -o $out' % ('g++' if cxx else 'gcc')
             depfile = '$out.d'
             deps = 'gcc'
 
-        self.n.rule('cc',
+        rule = 'cxx' if cxx else 'cc'
+        self.n.rule(rule,
                     command=command,
-                    description='CC $out',
+                    description='%s $out' % rule.upper(),
                     depfile=depfile,
                     deps=deps)
         self.newline()
 
         def build(source_file):
-            output = os.path.splitext(source_file)[0] + ('.obj' if mx.get_os() == 'windows' else '.o')
-            return self.n.build(output, 'cc', self._resolve(source_file))[0]
+            output = os.path.splitext(source_file)[0] + ('.obj' if mx.is_windows() else '.o')
+            return self.n.build(output, rule, self._resolve(source_file))[0]
+
+        return build
+
+    def asm_rule(self):
+        assert mx.is_windows()
+
+        self.n.rule('cpp',
+                    command='cl -nologo -showIncludes -EP -P $includes $cflags -c $in -Fi$out',
+                    description='CPP $out',
+                    deps='msvc')
+        self.newline()
+
+        self.n.rule('asm',
+                    command='ml64 -nologo -Fo$out -c $in',
+                    description='ASM $out')
+        self.newline()
+
+        def preprocessed(source_file):
+            output = os.path.splitext(source_file)[0] + '.asm'
+            return self.n.build(output, 'cpp', self._resolve(source_file))[0]
+
+        def build(source_file):
+            output = os.path.splitext(source_file)[0] + '.obj'
+            return self.n.build(output, 'asm', preprocessed(source_file))[0]
 
         return build
 
     def ar_rule(self):
-        if mx.get_os() == 'windows':
+        if mx.is_windows():
             command = 'lib -nologo -out:$out $in'
         else:
             command = 'ar -rc $out $in'
@@ -326,11 +400,11 @@ class NinjaManifestGenerator(object):
 
         return lambda archive, members: self.n.build(archive, 'ar', members)[0]
 
-    def link_rule(self):
-        if mx.get_os() == 'windows':
-            command = 'link -nologo $ldflags -out:$out $in'
+    def link_rule(self, cxx=False):
+        if mx.is_windows():
+            command = 'link -nologo $ldflags -out:$out $in $ldlibs'
         else:
-            command = 'gcc $ldflags -o $out $in'
+            command = '%s $ldflags -o $out $in $ldlibs' % ('g++' if cxx else 'gcc')
 
         self.n.rule('link',
                     command=command,
@@ -377,7 +451,7 @@ class NinjaManifestGenerator(object):
         self.newline()
 
 
-class DefaultNativeProject(NinjaProject):
+class DefaultNativeProject(NinjaProject):  # pylint: disable=too-many-ancestors
     """A NinjaProject that makes many assumptions when generating a build manifest.
 
     It is assumed that:
@@ -387,9 +461,13 @@ class DefaultNativeProject(NinjaProject):
 
         #. There is only one deliverable:
             - Kind is the value of the `native` attribute, and
-            - Name is derived from the `name` of the project.
+            - Name is the value of the `deliverable` attribute if it is specified,
+              otherwise it is derived from the `name` of the project.
 
         #. All source files are supported and necessary to build the deliverable.
+
+        #. All `include_dirs` and `libs` provided by build dependencies are necessary
+           to build the deliverable.
 
         #. The deliverable and the public headers are intended for distribution.
 
@@ -399,36 +477,44 @@ class DefaultNativeProject(NinjaProject):
 
             Depending on the value, the necessary flags will be prepended to `cflags`
             and `ldflags` automatically.
+        deliverable : str, optional
+            Name of the deliverable. By default, it is derived from the `name` of the
+            project.
     """
     include = 'include'
     src = 'src'
 
     _kinds = dict(
         static_lib=dict(
-            target=lambda name: mx.add_lib_prefix(name) + ('.lib' if mx.get_os() == 'windows' else '.a'),
+            target=lambda name: mx.add_lib_prefix(name) + ('.lib' if mx.is_windows() else '.a'),
         ),
         shared_lib=dict(
             target=lambda name: mx.add_lib_suffix(mx.add_lib_prefix(name)),
         ),
     )
 
-    def __init__(self, suite, name, subDir, srcDirs, deps, workingSets, d, theLicense, kind, **kwargs):
+    def __init__(self, suite, name, subDir, srcDirs, deps, workingSets, d, kind, **kwargs):
+        self.deliverable = kwargs.pop('deliverable', name.split('.')[-1])
         if srcDirs:
             mx.abort('"sourceDirs" is not supported for default native projects')
         srcDirs += [self.include, self.src]
-        super(DefaultNativeProject, self).__init__(suite, name, subDir, srcDirs, deps, workingSets, d, theLicense,
-                                                   **kwargs)
-        if next(os.walk(mx.join(self.dir, self.include)))[1]:
-            mx.abort('include directory must have a flat structure')
+        super(DefaultNativeProject, self).__init__(suite, name, subDir, srcDirs, deps, workingSets, d, **kwargs)
         try:
             self._kind = self._kinds[kind]
         except KeyError:
             mx.abort('"native" should be one of {}, but "{}" is given'.format(self._kinds.keys(), kind))
-        self._deliverable = name.split('.')[-1]
+
+        include_dir = mx.join(self.dir, self.include)
+        if next(os.walk(include_dir))[1]:
+            mx.abort('include directory must have a flat structure')
+
+        self.include_dirs = [include_dir]
+        if kind == 'static_lib':
+            self.libs = [mx.join(self.out_dir, self._target)]
 
     @property
     def _target(self):
-        return self._kind['target'](self._deliverable)
+        return self._kind['target'](self.deliverable)
 
     @property
     def cflags(self):
@@ -446,46 +532,73 @@ class DefaultNativeProject(NinjaProject):
         if self._kind == self._kinds['shared_lib']:
             default_ldflags += dict(
                 darwin=['-dynamiclib', '-undefined', 'dynamic_lookup'],
-                windows=['-DLL'],
+                windows=['-dll'],
             ).get(mx.get_os(), ['-shared', '-fPIC'])
 
         return default_ldflags + super(DefaultNativeProject, self).ldflags
 
     @property
-    def c_files(self):
-        return self._source['files']['.c']
+    def h_files(self):
+        return self._source['files'].get('.h', [])
 
     @property
-    def h_files(self):
-        return self._source['files']['.h']
+    def c_files(self):
+        return self._source['files'].get('.c', [])
+
+    @property
+    def cxx_files(self):
+        return self._source['files'].get('.cc', [])
+
+    @property
+    def asm_sources(self):
+        return self._source['files'].get('.S', [])
 
     def generate_manifest(self, path):
-        unsupported_source_files = list(self._source['files'].viewkeys() - {'.c', '.h'})
+        unsupported_source_files = list(self._source['files'].viewkeys() - {'.h', '.c', '.cc', '.S'})
         if unsupported_source_files:
             mx.abort('{} source files are not supported by default native projects'.format(unsupported_source_files))
 
         with NinjaManifestGenerator(self, open(path, 'w')) as gen:
             gen.comment('Project rules')
-            cc = gen.cc_rule()
+            cc = cxx = asm = None
+            if self.c_files:
+                cc = gen.cc_rule()
+            if self.cxx_files:
+                cxx = gen.cc_rule(cxx=True)
+            if self.asm_sources:
+                asm = gen.asm_rule() if mx.is_windows() else cc if cc else gen.cc_rule()
 
             ar = link = None
             if self._kind == self._kinds['static_lib']:
                 ar = gen.ar_rule()
             else:
-                link = gen.link_rule()
+                link = gen.link_rule(cxx=bool(self.cxx_files))
 
-            gen.variables(cflags=self.cflags, ldflags=self.ldflags if link else None)
-            gen.include(collections.OrderedDict.fromkeys([mx.dirname(h_file) for h_file in self.h_files]).keys())
+            gen.variables(
+                cflags=self.cflags,
+                ldflags=self.ldflags if link else None,
+                ldlibs=self.ldlibs if link else None,
+            )
+            gen.include(collections.OrderedDict.fromkeys(
+                # remove the duplicates while maintaining the ordering
+                [mx.dirname(h_file) for h_file in self.h_files] + list(itertools.chain.from_iterable(
+                    getattr(d, 'include_dirs', []) for d in self.buildDependencies))
+            ).keys())
 
             gen.comment('Compiled project sources')
             object_files = [cc(f) for f in self.c_files]
+            gen.newline()
+            object_files += [cxx(f) for f in self.cxx_files]
+            gen.newline()
+            object_files += [asm(f) for f in self.asm_sources]
             gen.newline()
 
             gen.comment('Project deliverable')
             if self._kind == self._kinds['static_lib']:
                 ar(self._target, object_files)
             else:
-                link(self._target, object_files)
+                link(self._target, object_files + list(itertools.chain.from_iterable(
+                    getattr(d, 'libs', []) for d in self.buildDependencies)))
 
     def getArchivableResults(self, use_relpath=True, single=False):
         def result(base_dir, file_path):

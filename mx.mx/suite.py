@@ -134,12 +134,20 @@ suite = {
       "license": "BSD-new",
     },
 
-    "FINDBUGS_DIST" : {
+    "SPOTBUGS_3.0.0" : {
       "urls" : [
         "https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/findbugs-3.0.0.zip",
         "http://sourceforge.net/projects/findbugs/files/findbugs/3.0.0/findbugs-3.0.0.zip/download",
       ],
       "sha1" : "6e56d67f238dbcd60acb88a81655749aa6419c5b",
+    },
+
+    "SPOTBUGS_3.1.11" : {
+      "urls" : [
+        "https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/spotbugs-3.1.11.zip",
+        "https://repo.maven.apache.org/maven2/com/github/spotbugs/spotbugs/3.1.11/spotbugs-3.1.11.zip",
+      ],
+      "sha1" : "8f961e0ddd445cc4e89b18563ac5730766d220f1",
     },
 
     "SIGTEST" : {
@@ -346,6 +354,10 @@ suite = {
             "urls" : ["https://github.com/ninja-build/ninja/releases/download/v{version}/ninja-linux.zip"],
             "sha1" : "987234c4ce45505c21302e097c24efef4873325c"
           },
+          "aarch64" : {
+            "urls" : ["https://lafo.ssw.uni-linz.ac.at/pub/graal-external-deps/ninja-{version}-linux-aarch64.zip"],
+            "sha1" : "0939b204638c8aae5e2fc2bf9c7576c805d65331"
+          },
           "<others>" : {
             "optional" : True
           }
@@ -375,7 +387,17 @@ suite = {
       "version" : "1.7.2",
       "urls" : ["https://pypi.org/packages/source/n/ninja_syntax/ninja_syntax-{version}.tar.gz"],
       "sha1" : "702ca2d0ae93841c5ab75e4d119b29780ec0b7d9"
-    }
+    },
+
+    "SONARSCANNER_CLI_3_3_0_1492": {
+      "sha1": "9116a2763e257dbc0251c18cd7dd975c588f0169",
+      "maven": {
+        "groupId": "org.sonarsource.scanner.cli",
+        "artifactId": "sonar-scanner-cli",
+        "version": "3.3.0.1492",
+      },
+      "licence": "LGPLv30",
+    },
   },
 
   "licenses" : {
@@ -394,6 +416,10 @@ suite = {
     "LGPLv21" : {
       "name" : "GNU Lesser General Public License, version 2.1",
       "url" : "http://www.gnu.org/licenses/old-licenses/lgpl-2.1.en.html"
+    },
+    "LGPLv30": {
+      "name": "GNU Lesser General Public License, version 3.0",
+      "url": "http://www.gnu.org/licenses/lgpl-3.0.en.html"
     },
     "MIT" : {
       "name" : "MIT License",
@@ -420,7 +446,7 @@ suite = {
       "checkstyle" : "com.oracle.mxtool.junit",
       "javaCompliance" : "1.8+",
       "annotationProcessors" : ["JMH_1_21"],
-      "findbugsIgnoresGenerated" : True,
+      "spotbugsIgnoresGenerated" : True,
     },
 
     "com.oracle.mxtool.junit" : {
